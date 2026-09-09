@@ -1,0 +1,37 @@
+# =============================================================================
+#  Kafka Connect + Debezium PostgreSQL Connector
+#
+#  База — confluentinc/cp-kafka-connect той же линейки, что брокер и Schema
+#  Registry (CP 7.7 = Kafka 3.7). Debezium 2.6 собран против Kafka Connect
+#  3.7.0, поэтому линейки совпадают.
+#
+#  Важно про avro-converter: он берётся ИЗ ЭТОГО ОБРАЗА
+#  (/usr/share/java/kafka-serde-tools), то есть версии 7.7.1. Согласованные
+#  6.0.2/6.1.2 сюда подкладывать НЕЛЬЗЯ — это линейка Kafka 2.6/2.7, воркер
+#  упадёт на NoSuchMethodError при первой сериализации. См. .env.
+#
+#  Java-кода и сборки в проекте нет: плагин ставится готовым артефактом с
+#  Maven Central.
+# =============================================================================
+ARG CONFLUENT_VERSION=7.7.1
+FROM confluentinc/cp-kafka-connect:${CONFLUENT_VERSION}
+
+# 2.6.1.Final — согласованная версия. РЕКОМЕНДУЕТСЯ 2.6.2.Final: там починен
+# race condition при флаше offset в PostgreSQL (расхождение подтверждённого
+# LSN в слоте и состояния топиков -> потеря событий при рестарте) и
+# совместимость Avro. Апгрейд = смена этого ARG и `make build`.
+ARG DEBEZIUM_VERSION=2.6.1.Final
+
+USER root
+
+RUN set -eux; \
+    mkdir -p /usr/share/confluent-hub-components; \
+    curl -fsSL \
+      "https://repo1.maven.org/maven2/io/debezium/debezium-connector-postgres/${DEBEZIUM_VERSION}/debezium-connector-postgres-${DEBEZIUM_VERSION}-plugin.tar.gz" \
+      -o /tmp/dbz.tar.gz; \
+    tar -xzf /tmp/dbz.tar.gz -C /usr/share/confluent-hub-components; \
+    rm -f /tmp/dbz.tar.gz; \
+    chown -R appuser:appuser /usr/share/confluent-hub-components; \
+    ls -1 /usr/share/confluent-hub-components/debezium-connector-postgres/ | head -20
+
+USER appuser

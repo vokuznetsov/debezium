@@ -1,0 +1,427 @@
+# =============================================================================
+#  CDC-стенд: PostgreSQL (кластер 1 master + 2 реплики) -> Debezium -> Kafka
+#
+#  Версии заданы в .env, там же — комментарий к каждой: с чем конфликтует,
+#  что рекомендуется вместо неё и почему. Сводка — README.md, раздел 9.
+#
+#  Профили:
+#    (по умолчанию)  pg-master, pg-replica-1, pg-replica-2, pg-init,
+#                    kafka, kafka-init, schema-registry, connect, kafka-ui
+#    tools           kcat — разовые проверки
+#    sink            mssql — приёмник (Б), в части 1 не используется
+#
+#  Данные переживают `docker compose down`: всё состояние в именованных томах.
+#  Полный сброс — только `make clean` (down -v), и только целиком: состояние
+#  PostgreSQL и Kafka описывает ОДНУ точку (см. README, раздел 3).
+# =============================================================================
+
+x-pg-common: &pg-common
+  # PostgreSQL 17.9. Почему именно 17 и в чём риск связки с Debezium 2.6 —
+  # см. комментарий к POSTGRES_VERSION в .env.
+  image: postgres:${POSTGRES_VERSION}
+  restart: unless-stopped
+  stop_grace_period: 30s
+
+services:
+
+  # ===========================================================================
+  #  pg-master — источник CDC
+  # ===========================================================================
+  pg-master:
+    <<: *pg-common
+    container_name: pg-master
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Каталог данных — подкаталог тома. Так том может нести и другие файлы,
+      # и pg_basebackup на репликах не спорит с содержимым точки монтирования.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    # Конфиг вынесен в файл, а не в набор -c: параметров много, и они должны
+    # читаться как документ. hba_file приходится задавать явно — при
+    # переопределении config_file Postgres ищет pg_hba рядом с ним.
+    command: >
+      postgres
+      -c config_file=/etc/postgresql/postgresql.conf
+      -c hba_file=/etc/postgresql/pg_hba.conf
+    volumes:
+      - pg_master_data:/var/lib/postgresql/data
+      - ./pg/master/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./pg/master/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    ports:
+      - "${PG_MASTER_PORT}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks: [cdc]
+
+  # ===========================================================================
+  #  pg-init — одноразовая идемпотентная инициализация
+  #
+  #  Создаёт роли, схемы, ФИЗИЧЕСКИЕ СЛОТЫ РЕПЛИК, логический слот CDC с
+  #  failover => true и публикацию. Реплики зависят от успешного завершения
+  #  этого сервиса — поэтому их бутстрап через pg_basebackup -S <slot> всегда
+  #  находит слот готовым. Никаких sleep в цепочке нет.
+  # ===========================================================================
+  pg-init:
+    image: postgres:${POSTGRES_VERSION}
+    container_name: pg-init
+    restart: "no"
+    depends_on:
+      pg-master:
+        condition: service_healthy
+    environment:
+      PRIMARY_HOST: pg-master
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      REPL_USER: ${REPL_USER}
+      REPL_PASSWORD: ${REPL_PASSWORD}
+      DEBEZIUM_USER: ${DEBEZIUM_USER}
+      DEBEZIUM_PASSWORD: ${DEBEZIUM_PASSWORD}
+      REPLICA1_SLOT: ${REPLICA1_SLOT}
+      REPLICA2_SLOT: ${REPLICA2_SLOT}
+      CDC_SLOT: ${CDC_SLOT}
+      CDC_PUBLICATION: ${CDC_PUBLICATION}
+      # Состав CDC — единая точка правки, см. CDC_SCHEMAS в .env
+      CDC_SCHEMAS: ${CDC_SCHEMAS}
+      # Переопределяется в scenario-cold-start.sh: там слот создаётся отдельным
+      # шагом, чтобы показать, что граница потока — момент создания слота.
+      CREATE_CDC_SLOT: ${CREATE_CDC_SLOT:-true}
+      SEED_DATA: ${SEED_DATA:-true}
+      # Точечный список таблиц для REPLICA IDENTITY FULL (по умолчанию пусто:
+      # все таблицы DEFAULT, только PK — см. инвариант №2).
+      REPLICA_IDENTITY_FULL: ${REPLICA_IDENTITY_FULL:-}
+    volumes:
+      - ./sql:/sql:ro
+      - ./scripts:/scripts:ro
+    entrypoint: ["bash", "/scripts/pg-init.sh"]
+    networks: [cdc]
+
+  # ===========================================================================
+  #  pg-replica-1 / pg-replica-2 — hot standby
+  #
+  #  Бутстрап через pg_basebackup -R -X stream -S <свой слот>.
+  #  sync_replication_slots = on: slotsync-воркер поддерживает локальную копию
+  #  логического слота CDC (failover = true), чтобы промоушен не уничтожил CDC.
+  #
+  #  С СИНХРОНИЗИРОВАННОГО СЛОТА НА РЕПЛИКЕ ЧИТАТЬ НЕЛЬЗЯ до промоушена —
+  #  PostgreSQL это запрещает. Разгрузить CDC на реплику невозможно, Debezium
+  #  ходит только на мастер. См. README, раздел 6.
+  # ===========================================================================
+  pg-replica-1:
+    <<: *pg-common
+    container_name: pg-replica-1
+    depends_on:
+      pg-master:
+        condition: service_healthy
+      # Ключевая зависимость: физический слот replica_1_slot создаёт pg-init.
+      # Без service_completed_successfully реплика попыталась бы сделать
+      # basebackup на несуществующем слоте.
+      pg-init:
+        condition: service_completed_successfully
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+      PRIMARY_HOST: pg-master
+      REPLICA_NAME: pg-replica-1
+      REPLICA_SLOT: ${REPLICA1_SLOT}
+      REPL_USER: ${REPL_USER}
+      REPL_PASSWORD: ${REPL_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    entrypoint: ["bash", "/opt/scripts/replica-entrypoint.sh"]
+    volumes:
+      - pg_replica1_data:/var/lib/postgresql/data
+      - ./pg/replica/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./pg/replica/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./scripts:/opt/scripts:ro
+    ports:
+      - "${PG_REPLICA1_PORT}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    networks: [cdc]
+
+  pg-replica-2:
+    <<: *pg-common
+    container_name: pg-replica-2
+    depends_on:
+      pg-master:
+        condition: service_healthy
+      pg-init:
+        condition: service_completed_successfully
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+      PRIMARY_HOST: pg-master
+      REPLICA_NAME: pg-replica-2
+      REPLICA_SLOT: ${REPLICA2_SLOT}
+      REPL_USER: ${REPL_USER}
+      REPL_PASSWORD: ${REPL_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    entrypoint: ["bash", "/opt/scripts/replica-entrypoint.sh"]
+    volumes:
+      - pg_replica2_data:/var/lib/postgresql/data
+      - ./pg/replica/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./pg/replica/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./scripts:/opt/scripts:ro
+    ports:
+      - "${PG_REPLICA2_PORT}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    networks: [cdc]
+
+  # ===========================================================================
+  #  kafka — Confluent Platform 7.7.1 (Kafka 3.7), KRaft, один брокер
+  # ===========================================================================
+  kafka:
+    image: confluentinc/cp-kafka:${CONFLUENT_VERSION}
+    container_name: kafka
+    restart: unless-stopped
+    environment:
+      # --- KRaft ---
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Cluster ID фиксирован в .env. Если его сгенерировать на старте, том
+      # kafka_data не переживёт пересоздание контейнера: в meta.properties
+      # останется прежний id и брокер откажется стартовать с
+      # "Cluster ID doesn't match".
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID}
+      # --- listeners ---
+      # PLAINTEXT — для контейнеров (kafka:9092), EXTERNAL — для скриптов с
+      # хоста (localhost:29092). Проверки из спеки (kcat -b kafka:9092)
+      # гоняются внутри compose-сети, профиль tools.
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:${KAFKA_EXTERNAL_PORT}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # --- один брокер ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # --- ОГРАНИЧЕНИЕ КОНТУРА ---
+      # Топики создаются заранее (kafka-init). Отсутствующий топик должен
+      # ронять сервис, а не тихо появляться с дефолтными 1 партицией и
+      # дефолтной политикой очистки. Для cdc.events автосоздание особенно
+      # опасно: топик появился бы с cleanup.policy из дефолта брокера.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: -Xms512M -Xmx1G
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    ports:
+      - "${KAFKA_EXTERNAL_PORT}:29092"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+    networks: [cdc]
+
+  # ===========================================================================
+  #  kafka-init — одноразовое идемпотентное создание ВСЕХ топиков.
+  #  Отрабатывает ДО schema-registry и connect: с выключенным auto-create они
+  #  без своих топиков не стартуют.
+  # ===========================================================================
+  kafka-init:
+    image: confluentinc/cp-kafka:${CONFLUENT_VERSION}
+    container_name: kafka-init
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP: kafka:9092
+      CDC_TOPIC: ${CDC_TOPIC}
+      TOPIC_PREFIX: ${TOPIC_PREFIX}
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint: ["bash", "/scripts/kafka-init.sh"]
+    networks: [cdc]
+
+  # ===========================================================================
+  #  schema-registry — CP 7.7.1
+  #  Хранилище — заранее созданный топик _schemas (compact).
+  # ===========================================================================
+  schema-registry:
+    image: confluentinc/cp-schema-registry:${CONFLUENT_VERSION}
+    container_name: schema-registry
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:9092
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 1
+      # backward — дефолт SR. Он и есть причина, по которой обязательна
+      # TopicRecordNameStrategy: при дефолтной TopicNameStrategy схемы всех
+      # 500 таблиц попали бы в ОДИН subject cdc.events-value и SR зарубил бы
+      # их по совместимости на второй же таблице.
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: backward
+      SCHEMA_REGISTRY_HEAP_OPTS: -Xms256M -Xmx512M
+    ports:
+      - "${SCHEMA_REGISTRY_PORT}:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/subjects >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    networks: [cdc]
+
+  # ===========================================================================
+  #  connect — Kafka Connect с плагином Debezium PostgreSQL
+  # ===========================================================================
+  connect:
+    build:
+      context: .
+      dockerfile: Dockerfile.connect
+      args:
+        CONFLUENT_VERSION: ${CONFLUENT_VERSION}
+        DEBEZIUM_VERSION: ${DEBEZIUM_VERSION}
+    image: cdc-connect:${CONFLUENT_VERSION}-dbz${DEBEZIUM_VERSION}
+    container_name: connect
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      schema-registry:
+        condition: service_healthy
+      pg-master:
+        condition: service_healthy
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: kafka:9092
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: cdc-connect-cluster
+      # Служебные топики — заранее созданные kafka-init. Значения partitions
+      # ОБЯЗАНЫ совпадать с тем, что создано (25 и 5), иначе воркер не
+      # стартует: он сверяет фактическое число партиций со своим конфигом.
+      CONNECT_CONFIG_STORAGE_TOPIC: connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_PARTITIONS: 25
+      CONNECT_STATUS_STORAGE_PARTITIONS: 5
+      # --- конвертеры ---
+      CONNECT_KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: ${SCHEMA_REGISTRY_INTERNAL_URL}
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: ${SCHEMA_REGISTRY_INTERNAL_URL}
+      # --- ОГРАНИЧЕНИЕ КОНТУРА: воркер не создаёт топиков ---
+      CONNECT_TOPIC_CREATION_ENABLE: "false"
+      # ---------------------------------------------------------------------
+      #  КРИТИЧНО: без этой политики Connect МОЛЧА ИГНОРИРУЕТ все
+      #  producer.override.* из конфига коннектора и берёт настройки воркера.
+      #  Это самый неприятный вариант отказа: конфиг коннектора выглядит
+      #  правильным (idempotence, acks=all, max.in.flight), а фактических
+      #  гарантий порядка нет — ни ошибки, ни предупреждения.
+      #  verify-infra.sh проверяет, что override реально действует.
+      # ---------------------------------------------------------------------
+      CONNECT_CONNECTOR_CLIENT_CONFIG_OVERRIDE_POLICY: All
+      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
+      CONNECT_LOG4J_ROOT_LOGLEVEL: INFO
+      CONNECT_LOG4J_LOGGERS: "org.reflections=ERROR,org.apache.kafka.connect.runtime.WorkerSinkTask=WARN"
+      KAFKA_HEAP_OPTS: -Xms256M -Xmx1G
+    ports:
+      - "${CONNECT_PORT}:8083"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connector-plugins >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+    networks: [cdc]
+
+  # ===========================================================================
+  #  kafka-ui — kafbat (provectus-версия заархивирована)
+  # ===========================================================================
+  kafka-ui:
+    image: ${KAFKA_UI_IMAGE}
+    container_name: kafka-ui
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: cdc
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: ${SCHEMA_REGISTRY_INTERNAL_URL}
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+      DYNAMIC_CONFIG_ENABLED: "true"
+    ports:
+      - "${KAFKA_UI_PORT}:8080"
+    networks: [cdc]
+
+  # ===========================================================================
+  #  kcat — профиль tools, разовые проверки.
+  #  Запуск: docker compose --profile tools run --rm kcat -b kafka:9092 -L
+  #
+  #  Образ amd64-only, на arm64-хосте идёт через эмуляцию (для разовых
+  #  проверок это приемлемо). Сборка edenhill/kcat включает поддержку
+  #  avro/Schema Registry (-s value=avro -r ...), это и требуется в
+  #  verify-order.sh.
+  # ===========================================================================
+  kcat:
+    image: ${KCAT_IMAGE}
+    platform: linux/amd64
+    container_name: kcat
+    profiles: [tools]
+    restart: "no"
+    networks: [cdc]
+
+  # ===========================================================================
+  #  mssql — приёмник (Б). В ЧАСТИ 1 НЕ ИСПОЛЬЗУЕТСЯ.
+  #
+  #  Профиль sink, потому что образ существует только под linux/amd64: на
+  #  arm64-хосте это эмуляция, ~2 ГБ RAM и минута на старт, а пользы в части 1
+  #  ноль. Поднять: make up-sink.
+  # ===========================================================================
+  mssql:
+    image: ${MSSQL_IMAGE}
+    platform: linux/amd64
+    container_name: mssql
+    profiles: [sink]
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      MSSQL_PID: Developer
+    volumes:
+      - mssql_data:/var/opt/mssql
+    ports:
+      - "${MSSQL_PORT}:1433"
+    networks: [cdc]
+
+networks:
+  cdc:
+    name: cdc
+
+volumes:
+  pg_master_data:
+  pg_replica1_data:
+  pg_replica2_data:
+  kafka_data:
+  mssql_data:

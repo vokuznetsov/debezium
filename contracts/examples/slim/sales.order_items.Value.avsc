@@ -1,0 +1,111 @@
+{
+  "connect.name": "dbz.sales.order_items.Value",
+  "fields": [
+    {
+      "default": 0,
+      "name": "id",
+      "type": {
+        "connect.default": 0,
+        "type": "long"
+      },
+      "doc": "Первичный ключ. В ключе сообщения (subject ...Key) едет он же — UPDATE и DELETE в (Б) идут по нему."
+    },
+    {
+      "name": "order_id",
+      "type": "long",
+      "doc": "Внешний ключ. Родительская строка в топике всегда РАНЬШЕ этой: порядок совпадает с порядком WAL. Поэтому consumer части 2 не разбирает зависимости FK."
+    },
+    {
+      "name": "product_id",
+      "type": "long",
+      "doc": "Внешний ключ. Родительская строка в топике всегда РАНЬШЕ этой: порядок совпадает с порядком WAL. Поэтому consumer части 2 не разбирает зависимости FK."
+    },
+    {
+      "name": "qty",
+      "type": "int"
+    },
+    {
+      "name": "price",
+      "type": {
+        "connect.name": "org.apache.kafka.connect.data.Decimal",
+        "connect.parameters": {
+          "connect.decimal.precision": "18",
+          "scale": "4"
+        },
+        "connect.version": 1,
+        "logicalType": "decimal",
+        "precision": 18,
+        "scale": 4,
+        "type": "bytes"
+      },
+      "doc": "ДЕНЕЖНОЕ ПОЛЕ. decimal.handling.mode=precise, поэтому это Avro bytes + logicalType=decimal: unscaled value со scale из connect.parameters. НЕ переключать на double — уменьшит сообщение и молча испортит значения."
+    },
+    {
+      "default": null,
+      "name": "__deleted",
+      "type": [
+        "null",
+        "string"
+      ],
+      "doc": "\"true\" у события удаления. Следствие delete.handling.mode=rewrite: DELETE приезжает СТРОКОЙ с этим флагом, а не пустым значением (tombstone). Tombstone'ов в потоке нет вообще."
+    },
+    {
+      "default": null,
+      "name": "__op",
+      "type": [
+        "null",
+        "string"
+      ],
+      "doc": "Тип операции: c=insert, u=update, d=delete, r=snapshot. Источник — поле op конверта Debezium."
+    },
+    {
+      "default": null,
+      "name": "__table",
+      "type": [
+        "null",
+        "string"
+      ],
+      "doc": "Имя таблицы без схемы. Второй способ определить источник — полное имя этого Avro-рекорда."
+    },
+    {
+      "default": null,
+      "name": "__schema",
+      "type": [
+        "null",
+        "string"
+      ],
+      "doc": "Имя схемы PostgreSQL."
+    },
+    {
+      "default": null,
+      "name": "__lsn",
+      "type": [
+        "null",
+        "long"
+      ],
+      "doc": "ПОЗИЦИЯ В WAL. На ней держатся порядок и идемпотентность consumer'а части 2: хранить последний применённый __lsn в служебной таблице MS SQL и писать его В ТОЙ ЖЕ транзакции, что и данные. Убирать это поле ради экономии нельзя."
+    },
+    {
+      "default": null,
+      "name": "__txId",
+      "type": [
+        "null",
+        "long"
+      ],
+      "doc": "Идентификатор транзакции PostgreSQL. Границы транзакций едут отдельным топиком dbz.transaction."
+    },
+    {
+      "default": null,
+      "name": "__ts_ms",
+      "type": [
+        "null",
+        "long"
+      ],
+      "doc": "Время события в источнике, мс. Годится для расчёта лага применения."
+    }
+  ],
+  "name": "Value",
+  "namespace": "dbz.sales.order_items",
+  "type": "record",
+  "doc": "ПРОФИЛЬ SLIM (основной). Значение сообщения топика cdc.events для таблицы sales.order_items: сама строка + 6 служебных полей. subject = cdc.events-dbz.sales.order_items.Value (TopicRecordNameStrategy). Полного конверта Debezium (before/after/source) здесь НЕТ — его снимает ExtractNewRecordState, это и есть основная экономия объёма."
+}
