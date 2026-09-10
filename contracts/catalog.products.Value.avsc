@@ -1,0 +1,121 @@
+{
+  "connect.name": "dbz.catalog.products.Value",
+  "fields": [
+    {
+      "default": 0,
+      "name": "id",
+      "type": {
+        "connect.default": 0,
+        "type": "long"
+      }
+    },
+    {
+      "name": "sku",
+      "type": "string"
+    },
+    {
+      "name": "name",
+      "type": "string"
+    },
+    {
+      "name": "supplier_id",
+      "type": "long"
+    },
+    {
+      "name": "currency_code",
+      "type": "string"
+    },
+    {
+      "name": "price",
+      "type": {
+        "connect.name": "org.apache.kafka.connect.data.Decimal",
+        "connect.parameters": {
+          "connect.decimal.precision": "18",
+          "scale": "4"
+        },
+        "connect.version": 1,
+        "logicalType": "decimal",
+        "precision": 18,
+        "scale": 4,
+        "type": "bytes"
+      }
+    },
+    {
+      "default": null,
+      "name": "description",
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    {
+      "default": "1970-01-01T00:00:00.000000Z",
+      "name": "updated_at",
+      "type": {
+        "connect.default": "1970-01-01T00:00:00.000000Z",
+        "connect.name": "io.debezium.time.ZonedTimestamp",
+        "connect.version": 1,
+        "type": "string"
+      }
+    },
+    {
+      "default": null,
+      "name": "__deleted",
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    {
+      "default": null,
+      "name": "__op",
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    {
+      "default": null,
+      "name": "__table",
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    {
+      "default": null,
+      "name": "__schema",
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    {
+      "default": null,
+      "name": "__lsn",
+      "type": [
+        "null",
+        "long"
+      ]
+    },
+    {
+      "default": null,
+      "name": "__txId",
+      "type": [
+        "null",
+        "long"
+      ]
+    },
+    {
+      "default": null,
+      "name": "__ts_ms",
+      "type": [
+        "null",
+        "long"
+      ]
+    }
+  ],
+  "name": "Value",
+  "namespace": "dbz.catalog.products",
+  "type": "record"
+}
