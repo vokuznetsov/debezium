@@ -133,6 +133,38 @@ docker compose exec schema-registry kafka-avro-console-consumer --bootstrap-serv
 в том числе сам консьюмер. Так что пустой топик до первого события — это норма,
 а не поломка.
 
+### `cleanup.policy` у `cdc.events` обязан быть `delete`
+
+Топик создаётся автосозданием и наследует настройки брокера. Значение по
+умолчанию — `delete`, то есть «хранить всё подряд, удалять старое по времени и
+размеру». Это единственный допустимый режим для `cdc.events`: приёмнику нужна
+вся цепочка событий по строке, а не только её последнее состояние.
+
+Проверять всё равно стоит — вместе с числом партиций это два параметра, которые
+портятся необратимо:
+
+```bash
+docker compose exec kafka kafka-configs --bootstrap-server kafka:9092 --entity-type topics --entity-name cdc.events --describe --all | grep cleanup.policy
+```
+
+Ожидается `cleanup.policy=delete`. Если топик почему-то создан с `compact`,
+политику можно переключить на лету:
+
+```bash
+docker compose exec kafka kafka-configs --bootstrap-server kafka:9092 --entity-type topics --entity-name cdc.events --alter --add-config cleanup.policy=delete
+```
+
+Но уже уплотнённые сегменты не восстановятся: события, которые compaction успел
+выбросить, потеряны. Если он поработал по топику — честный путь один: `down -v`
+и заново (шаг 8).
+
+Топик можно создать и явно, до первого клиента, — тогда обе настройки задаются
+сразу и автосоздание не участвует:
+
+```bash
+docker compose exec kafka kafka-topics --bootstrap-server kafka:9092 --create --topic cdc.events --partitions 1 --replication-factor 1 --config cleanup.policy=delete
+```
+
 ## 5. Внести изменения и увидеть их
 
 ```bash
@@ -364,8 +396,10 @@ PostgreSQL — offset'ы будут ссылаться на LSN, которог�
 
 * **Партиции у `cdc.events`.** Порядок Kafka гарантирует только внутри
   партиции. Добавили партиций — сломали порядок, и обратно уже не уменьшить.
-* **Compaction.** `cleanup.policy=compact` оставит по ключу только последнюю
-  версию строки, а приёмнику нужна история изменений.
+* **Compaction.** У `cdc.events` обязателен `cleanup.policy=delete` — это
+  дефолт брокера, но его надо проверить (шаг 4). `compact` оставит по ключу
+  только последнюю версию строки, а приёмнику нужна история изменений; уже
+  уплотнённое обратно не собрать.
 * **`tasks.max`.** Держим 1. Не путать с `max.in.flight` ниже — это разные
   настройки, у которых просто рядом стоят похожие числа. `tasks.max` — это
   параллелизм Kafka Connect, и у PostgreSQL-коннектора Debezium он ни на что
