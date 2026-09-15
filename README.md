@@ -466,8 +466,6 @@ http://localhost:8081/subjects.
 | `kafka-connect-avro-converter` | 7.7.1, из образа Connect | 6.x — линейка Kafka 2.6/2.7, с Kafka 3.7 несовместима |
 | Kafka UI | `kafbat/kafka-ui:v1.5.0` | provectus-версия заархивирована и из Docker Hub удалена |
 
-## 12. Что дальше
+## 12. Микросервис "CDC Target Sync Service (Java & MS SQL Server)"
 
-Вторая половина задачи — consumer, который читает `cdc.events` и применяет
-изменения в MS SQL. В этом репозитории её нет; для того, кто будет её писать, в
-[contracts/](contracts/) лежат схемы событий и правила чтения топика.
+Микросервис читает `cdc.events` и применяет изменения в MS SQL. Расположен в папке service с подробным описанием.
